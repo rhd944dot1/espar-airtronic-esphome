@@ -1,6 +1,8 @@
 # Espar Airtronic S3 B2L — CAN Bus Reverse Engineering & ESPHome Controller
 
 > Control and monitor your Espar Airtronic S3 gasoline heater from Home Assistant via CAN bus — no OEM controller required.
+>
+> **This branch adds remote start through a Teltonika GPS tracker** (tested with an FMC920 + Traccar): start/stop with 8 presets from anywhere over the tracker's mobile connection, feedback whether the heater runs — tracker and ESP32 talk over BLE only, no wiring. → [docs/teltonika-remote-start.md](docs/teltonika-remote-start.md)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![ESPHome](https://img.shields.io/badge/ESPHome-2026.3+-blue)](https://esphome.io)
@@ -44,6 +46,7 @@ This repository documents everything collected along the way — every raw captu
 - ✅ CAN fault state decoded — `0x2C4 D1=0x0B` with named fault codes (flame loss, overtemperature)
 - ✅ WS2812 RGB LED status indicator
 - ✅ ESPHome external component — drop-in, no custom firmware needed
+- ✅ **Remote start through a Teltonika tracker** (example config): command and feedback over BLE, 8 presets that end the run on the ESP itself, immediate acknowledge via the tracker, LAN path when the ESP is in WiFi — [guide](docs/teltonika-remote-start.md)
 
 ## What's still open
 
@@ -90,7 +93,8 @@ espar-airtronic-esphome/
 ├── docs/
 │   ├── protocol-reference.md   # All decoded CAN frames, payloads, encoding
 │   ├── hardware-setup.md       # Wiring, connectors, pinout
-│   └── fault-codes.md          # P-code table + confirmed D3 fault codes + remaining capture targets
+│   ├── fault-codes.md          # P-code table + confirmed D3 fault codes + remaining capture targets
+│   └── teltonika-remote-start.md # Remote start through a Teltonika tracker over BLE
 ├── captures/
 │   ├── README.md               # How captures were taken, equipment, settings
 │   ├── normal-operation/       # All RE phase captures, renamed descriptively
@@ -98,6 +102,8 @@ espar-airtronic-esphome/
 │   └── fault-codes/            # Outlet obstruction + fuel line pinch captures (two confirmed)
 ├── esphome/
 │   ├── espar-heater.yaml       # Ready-to-use ESPHome config
+│   ├── espar-heater-teltonika.yaml # Full config + Teltonika remote start
+│   ├── home-assistant/teltonika-remote-start.yaml # HA package for the remote start
 │   └── components/espar_can/   # External component source
 ├── arduino/
 │   ├── CAN_CSV_WeAct.ino           # Full controller sketch (HEAT/FAN/OFF + serial)
