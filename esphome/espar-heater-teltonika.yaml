@@ -1,0 +1,1125 @@
+# =============================================================================
+#  Espar Airtronic S3 CAN Controller — FULL example + Teltonika remote start
+#
+#  Same as espar-heater-full.yaml, plus remote start through a Teltonika GPS
+#  tracker (tested with an FMC920), in both directions over BLE — no wiring
+#  between tracker and ESP32. See docs/teltonika-remote-start.md.
+#
+#    Command  tracker → ESP:  the tracker's "BLE broadcasting service ID"
+#             (parameter 1111) is advertised as a 16-bit service UUID.
+#             0x53 | T000 CCCC — C = 0 off, 1–8 preset, T = toggle bit.
+#             Only a CHANGE triggers; the first value seen after boot is the
+#             baseline (no restart of a run after an ESP reboot).
+#    Feedback ESP → tracker:  manufacturer data FF FF 53 48|49 + 22 bytes,
+#             two pages alternating every 2 s, read by the tracker's
+#             "Advanced" BLE sensor table and sent to the server as AVL IO.
+#    LAN path: Home Assistant can call the action
+#             esphome.<node>_remote_preset directly; same code as the BLE path.
+#
+#  8 presets (mode, setpoint, duration) are settings on the ESP, editable in HA.
+#  The preset duration ends the run on the ESP itself — no network needed.
+#  Replace tracker_mac below with your tracker's BLE MAC.
+#
+#  Every diagnostic entity, grouped web dashboard.
+#  The minimal example is espar-heater.yaml; this file adds:
+#    - a select to switch the room sensor at run time
+#    - all read-only diagnostic entities (diagnostics: block)
+#    - a "Max Run Time" safety limit (the heater has none of its own)
+#    - web_server v3 with sorting groups
+#  See esphome/README.md: "Regulation", "Heater diagnostics".
+#
+#  Hardware:
+#    CAN TX: GPIO27    CAN RX: GPIO26    500 kbps
+#    XB10 Pin 7 (GYBU) = CAN H
+#    XB10 Pin 8 (GNYE) = CAN L
+#    XB10 Pin 2 (BRBK) = Ground reference
+#    Onboard 120Ω termination switch K3 — leave OFF when tapping mid-bus
+#
+#  Climate entity behaviour:
+#    HEAT mode  — sends HEAT continuously with the climate target as setpoint
+#                 and a room temperature; the heater starts, modulates,
+#                 pauses (no flame) and restarts by itself.
+#    FAN ONLY   — sends FAN command; heater runs blower, no combustion.
+#    OFF        — sends IDLE command.
+#
+#  Room temperature (select "Espar Room Sensor"):
+#    "Heater"   — the heater's own intake sensor (read over UDS), default
+#    "External" — the cabin sensor below (cabin_avg_temp)
+# =============================================================================
+
+substitutions:
+  tracker_mac: "AA:BB:CC:DD:EE:FF"   # BLE MAC of the Teltonika tracker
+
+esphome:
+  name: espar-heater
+  friendly_name: Espar Heater
+  on_boot:
+    priority: -100
+    then:
+      # Apply the stored choice of the select after boot
+      - lambda: |-
+          id(espar).set_room_sensor_controller(id(sel_room_sensor).active_index().value_or(0) == 1);
+      - light.turn_on:
+          id: status_led
+          red: 0%
+          green: 5%
+          blue: 0%
+          brightness: 20%
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+# ── Network ──────────────────────────────────────────────────────────────────
+api:
+  reboot_timeout: 0s        # vehicle out of WiFi range: do not reboot mid-run
+  encryption:
+    key: !secret api_encryption_key
+  actions:
+    # LAN path of the remote start: esphome.espar_heater_remote_preset(preset: 0–8)
+    - action: remote_preset
+      variables:
+        preset: int
+      then:
+        - if:
+            condition:
+              lambda: 'return preset >= 0 && preset <= 8;'
+            then:
+              - script.execute:
+                  id: run_cmd
+                  cmd: !lambda 'return preset;'
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  reboot_timeout: 0s        # see api
+
+  # Enable fallback hotspot (captive portal) in case wifi connection fails
+  ap:
+    ssid: "Espar-Heater Fallback Hotspot"
+    password: !secret fallback_hotspot_password
+
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+# Use DEBUG during development to see CAN frame activity.
+# Switch to INFO for production to reduce log noise.
+logger:
+  level: DEBUG
+
+# ── External component ────────────────────────────────────────────────────────
+external_components:
+  - source:
+      type: local
+      path: components
+    components: [espar_can]
+
+# ── Captive Portal ────────────────────────────────────────────────────────
+
+captive_portal:
+
+# ── Sensors ───────────────────────────────────────────────────────────────────
+sensor:
+  # Cabin averaged temperature pulled from HA via API.
+  # Update entity_id to match the template sensor you create in HA.
+  - platform: homeassistant
+    id: cabin_avg_temp
+    entity_id: sensor.cabin_average_temperature   # ← update to your HA sensor
+    unit_of_measurement: "°F"
+    filters:
+      - filter_out: nan                            # ignore unavailable readings
+      # No °F→°C lambda needed — cabin_temp_unit: fahrenheit handles conversion
+      # internally in the component.
+
+  # WiFi signal — useful for placement decisions in the Trooper
+  - platform: wifi_signal
+    id: wifi_rssi
+    name: "Espar Node WiFi Signal"
+    update_interval: 60s
+    web_server: {sorting_group_id: grp_diag, sorting_weight: 20}
+
+# ── Espar CAN controller ──────────────────────────────────────────────────────
+espar_can:
+  id: espar
+  name: "Espar Heater"
+  web_server: {sorting_group_id: grp_control, sorting_weight: 1}
+
+  # Unit of the cabin temperature sensor above.
+  cabin_temp_unit: fahrenheit
+
+  # Room temperature the heater regulates on. This is the default after
+  # flashing; the select below switches it at run time (survives a reboot).
+  room_sensor: heater
+
+  # Cabin sensor: sent to the heater when Room Sensor = "External".
+  current_temperature_sensor: cabin_avg_temp
+
+  # ── Heater status sensors ──────────────────────────────────────────────
+  heater_state:
+    name: "Espar Heater State"
+    web_server: {sorting_group_id: grp_state, sorting_weight: 1}
+    id: espar_heater_state
+    icon: mdi:fire
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: 'return x == "HEATING";'
+            then:
+              - light.turn_on:
+                  id: status_led
+                  red: 100%
+                  green: 30%
+                  blue: 0%
+                  brightness: 50%
+                  effect: "None"
+        - if:
+            condition:
+              lambda: 'return x == "FAN";'
+            then:
+              - light.turn_on:
+                  id: status_led
+                  red: 0%
+                  green: 0%
+                  blue: 100%
+                  brightness: 30%
+                  effect: "None"
+        - if:
+            condition:
+              lambda: 'return x == "IDLE";'
+            then:
+              - light.turn_on:
+                  id: status_led
+                  red: 0%
+                  green: 100%
+                  blue: 0%
+                  brightness: 15%
+                  effect: "None"
+        - if:
+            condition:
+              lambda: 'return x == "COOLDOWN";'
+            then:
+              - light.turn_on:
+                  id: status_led
+                  red: 100%
+                  green: 10%
+                  blue: 0%
+                  brightness: 20%
+                  effect: "None"
+
+  # True while the heater reports HEATING (0x2C4 D1=0x09) — includes the
+  # ignition ramp, so it turns on before combustion is established.
+  # YAML key stays `flame_active` for compatibility; entity was renamed from
+  # "Espar Flame Active" — see "Upgrading" in esphome/README.md.
+  flame_active:
+    name: "Espar Heating"
+    web_server: {sorting_group_id: grp_state, sorting_weight: 3}
+    id: espar_flame_active
+    device_class: running   # HA shows "Running / Not running" (heat would show "Hot / Normal")
+
+  # Raw 0x2C4 D2 bit5. Previously used as "flame"; it doesn't appear on every
+  # heater. Kept as a diagnostic so more data builds up across units/altitudes.
+  flag_0x20:
+    name: "Espar Status Flag 0x20"
+    web_server: {sorting_group_id: grp_diag, sorting_weight: 10}
+    id: espar_flag_0x20
+
+  heater_connected:
+    name: "Espar Connected"
+    web_server: {sorting_group_id: grp_state, sorting_weight: 4}
+    id: espar_connected
+    device_class: connectivity
+
+  fault_text:
+    name: "Espar Fault"
+    web_server: {sorting_group_id: grp_state, sorting_weight: 5}
+    id: espar_fault
+    icon: mdi:alert-circle-outline
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: 'return x != "OK";'
+            then:
+              - light.turn_on:
+                  id: status_led
+                  red: 100%
+                  green: 0%
+                  blue: 0%
+                  effect: "Fast Pulse"
+            else:
+              - light.turn_on:
+                  id: status_led
+                  red: 0%
+                  green: 5%
+                  blue: 0%
+                  brightness: 10%
+                  effect: "None"
+
+  # ── Heater diagnostics (read-only, UDS 0x7A0 → 0x73C) ────────────────
+  # Nothing is written, reset or cleared; nothing is sent in CAN Standby.
+  diagnostics:
+    update_interval: 10s        # while active; once a minute while idle
+    # State
+    combustion_phase:
+      id: d_phase
+      name: "Espar Phase"
+      icon: mdi:fire-circle
+      web_server: {sorting_group_id: grp_state, sorting_weight: 2}
+    flame_detected:
+      id: d_flame
+      name: "Espar Flame"
+      web_server: {sorting_group_id: grp_combustion, sorting_weight: 1}
+    phase_step:
+      name: "Espar Phase Step"
+      web_server: {sorting_group_id: grp_combustion, sorting_weight: 7}
+    phase_time:
+      name: "Espar Phase Time"
+      web_server: {sorting_group_id: grp_combustion, sorting_weight: 8}
+    # Regulation — what the heater itself is working with
+    heater_setpoint:
+      name: "Espar Heater Setpoint"
+      web_server: {sorting_group_id: grp_regulation, sorting_weight: 1}
+    heater_temperature:
+      id: d_heater_temp
+      name: "Espar Heater Temperature"
+      web_server: {sorting_group_id: grp_regulation, sorting_weight: 2}
+    intake_temperature:
+      id: d_intake
+      name: "Espar Intake Temperature"
+      web_server: {sorting_group_id: grp_regulation, sorting_weight: 3}
+    power_demand:
+      id: d_demand
+      name: "Espar Power Demand"
+      icon: mdi:gauge
+      web_server: {sorting_group_id: grp_regulation, sorting_weight: 4}
+    burn_time:
+      id: d_burn
+      name: "Espar Burn Time"
+      icon: mdi:timer-outline
+      web_server: {sorting_group_id: grp_regulation, sorting_weight: 5}
+    # Combustion
+    combustion_state:
+      name: "Espar Combustion State"
+      web_server: {sorting_group_id: grp_combustion, sorting_weight: 2}
+    flame_temperature:
+      id: d_flametemp
+      name: "Espar Flame Temperature"
+      web_server: {sorting_group_id: grp_combustion, sorting_weight: 3}
+    glow_plug:
+      id: d_glow
+      name: "Espar Glow Plug"
+      web_server: {sorting_group_id: grp_combustion, sorting_weight: 4}
+    glow_plug_power:
+      id: d_glowpw
+      name: "Espar Glow Plug Power"
+      web_server: {sorting_group_id: grp_combustion, sorting_weight: 5}
+    # Fuel
+    fuel_rate:
+      id: d_fuelrate
+      name: "Espar Fuel Rate"
+      icon: mdi:gas-station
+      web_server: {sorting_group_id: grp_fuel, sorting_weight: 1}
+    fuel_pump_frequency:
+      name: "Espar Fuel Pump"
+      icon: mdi:pump
+      web_server: {sorting_group_id: grp_fuel, sorting_weight: 2}
+    fuel_total:
+      id: d_fueltotal
+      name: "Espar Fuel Total"
+      icon: mdi:gas-station-outline
+      web_server: {sorting_group_id: grp_fuel, sorting_weight: 3}
+    fuel_pump_strokes:
+      id: d_strokes
+      name: "Espar Fuel Pump Strokes"
+      icon: mdi:counter
+      web_server: {sorting_group_id: grp_fuel, sorting_weight: 4}
+    # Electrics and blower
+    supply_voltage:
+      id: d_volt
+      name: "Espar Supply Voltage"
+      web_server: {sorting_group_id: grp_electrics, sorting_weight: 1}
+    blower_level:
+      id: d_blower
+      name: "Espar Blower Level"
+      icon: mdi:fan
+      web_server: {sorting_group_id: grp_electrics, sorting_weight: 2}
+    control_unit_temperature:
+      id: d_cutemp
+      name: "Espar Control Unit Temperature"
+      web_server: {sorting_group_id: grp_electrics, sorting_weight: 3}
+    air_pressure:
+      name: "Espar Air Pressure"
+      web_server: {sorting_group_id: grp_electrics, sorting_weight: 4}
+    # Counters (the heater's own)
+    operating_hours:
+      id: d_ophours
+      name: "Espar Operating Hours"
+      web_server: {sorting_group_id: grp_counters, sorting_weight: 1}
+    hours_power_0_25:
+      name: "Espar Hours 0-25 %"
+      web_server: {sorting_group_id: grp_counters, sorting_weight: 2}
+    hours_power_25_50:
+      name: "Espar Hours 25-50 %"
+      web_server: {sorting_group_id: grp_counters, sorting_weight: 3}
+    hours_power_50_75:
+      name: "Espar Hours 50-75 %"
+      web_server: {sorting_group_id: grp_counters, sorting_weight: 4}
+    hours_power_75_100:
+      name: "Espar Hours 75-100 %"
+      web_server: {sorting_group_id: grp_counters, sorting_weight: 5}
+    hours_control_pause:
+      name: "Espar Hours Control Pause"
+      web_server: {sorting_group_id: grp_counters, sorting_weight: 6}
+    hours_altitude_mode:
+      name: "Espar Hours Altitude Mode"
+      web_server: {sorting_group_id: grp_counters, sorting_weight: 7}
+    start_stop_count:
+      id: d_starts
+      name: "Espar Start/Stop Count"
+      icon: mdi:counter
+      web_server: {sorting_group_id: grp_counters, sorting_weight: 8}
+    # Identification
+    software_version:
+      name: "Espar Software Version"
+      web_server: {sorting_group_id: grp_ident, sorting_weight: 1}
+    hardware_version:
+      name: "Espar Hardware Version"
+      web_server: {sorting_group_id: grp_ident, sorting_weight: 2}
+    part_number:
+      name: "Espar Part Number"
+      web_server: {sorting_group_id: grp_ident, sorting_weight: 3}
+    # Fault memory (read on connect, on a fault, after each run, or via the button)
+    fault_memory:
+      id: d_faultmem
+      name: "Espar Fault Memory"
+      icon: mdi:alert-box-outline
+      web_server: {sorting_group_id: grp_diag, sorting_weight: 1}
+
+# ── Onboard WS2812 RGB LED (GPIO4) ───────────────────────────────────────────
+# Amber=heating  Blue=fan  Dim green=idle/connected  Red pulse=fault
+light:
+  - platform: esp32_rmt_led_strip
+    name: "Espar Status LED"
+    web_server: {sorting_group_id: grp_control, sorting_weight: 8}
+    id: status_led
+    rgb_order: GRB
+    chipset: WS2812
+    pin: GPIO4
+    num_leds: 1
+    effects:
+      - pulse:
+          name: "Fast Pulse"
+          transition_length: 0.25s
+          update_interval: 0.25s
+
+# ── Diagnostic / housekeeping ─────────────────────────────────────────────────
+binary_sensor:
+  # On while a remote-start preset is running
+  - platform: template
+    id: remote_input
+    name: "Espar Remote Command"
+    icon: mdi:remote
+    lambda: 'return id(active_preset) > 0;'
+    web_server: {sorting_group_id: grp_control, sorting_weight: 6}
+
+  - platform: status
+    name: "Espar Node Status"
+    device_class: connectivity
+    web_server: {sorting_group_id: grp_diag, sorting_weight: 21}
+
+button:
+  - platform: restart
+    name: "Restart Espar Controller"
+    icon: mdi:restart
+    web_server: {sorting_group_id: grp_control, sorting_weight: 9}
+  - platform: template
+    name: "Espar Read Fault Memory"
+    icon: mdi:alert-box-outline
+    web_server: {sorting_group_id: grp_diag, sorting_weight: 2}
+    on_press:
+      - lambda: id(espar).read_fault_memory();
+
+# ── CAN standby switch ────────────────────────────────────────────────────────
+# Suspends all outbound CAN frames without physically unplugging the WeAct.
+# Use before connecting a real EasyStart Pro / OEM diagnostic tool: the WeAct
+# emulates the EasyStart Pro (same CAN IDs); both transmitting has been seen to
+# trigger fault P000342 ("invalid configuration — check ADR coding").
+# Resuming automatically re-runs the CAN handshake.
+switch:
+  # Lock: when off, remote commands are refused (reported as "locked")
+  - platform: template
+    name: "Espar Remote Start"
+    id: remote_enable
+    icon: mdi:car-key
+    restore_mode: RESTORE_DEFAULT_ON
+    optimistic: true
+    web_server: {sorting_group_id: grp_control, sorting_weight: 7}
+
+  - platform: template
+    name: "Espar CAN Standby"
+    id: espar_standby
+    web_server: {sorting_group_id: grp_control, sorting_weight: 5}
+    icon: mdi:pause-circle-outline
+    restore_mode: ALWAYS_OFF
+    optimistic: true
+    turn_on_action:
+      - lambda: id(espar).set_tx_standby(true);
+    turn_off_action:
+      - lambda: id(espar).set_tx_standby(false);
+
+# ── Web dashboard with groups (optional — remove to save ~40 KB flash) ───────
+web_server:
+  port: 80
+  version: 3
+  sorting_groups:
+    - {id: grp_control,    name: "Control",        sorting_weight: 10}
+    - {id: grp_state,      name: "State",          sorting_weight: 20}
+    - {id: grp_regulation, name: "Regulation",     sorting_weight: 30}
+    - {id: grp_combustion, name: "Combustion",     sorting_weight: 40}
+    - {id: grp_fuel,       name: "Fuel",           sorting_weight: 50}
+    - {id: grp_electrics,  name: "Electrics and Blower", sorting_weight: 60}
+    - {id: grp_counters,   name: "Counters",       sorting_weight: 70}
+    - {id: grp_ident,      name: "Identification", sorting_weight: 80}
+    - {id: grp_diag,       name: "Diagnostics",    sorting_weight: 90}
+    - {id: grp_presets,    name: "Remote Presets", sorting_weight: 95}
+
+# ── Room sensor, switchable from HA ─────────────────────────────────────────
+select:
+  # ── Remote-start presets 1–8 (a remote command selects one)
+  - platform: template
+    name: "Espar Preset 1 Mode"
+    id: preset1_mode
+    icon: mdi:numeric-1-box-outline
+    optimistic: true
+    restore_value: true
+    options: ["Heat", "Fan"]
+    initial_option: "Heat"
+    entity_category: config
+    web_server: {sorting_group_id: grp_presets, sorting_weight: 10}
+  - platform: template
+    name: "Espar Preset 2 Mode"
+    id: preset2_mode
+    icon: mdi:numeric-2-box-outline
+    optimistic: true
+    restore_value: true
+    options: ["Heat", "Fan"]
+    initial_option: "Heat"
+    entity_category: config
+    web_server: {sorting_group_id: grp_presets, sorting_weight: 20}
+  - platform: template
+    name: "Espar Preset 3 Mode"
+    id: preset3_mode
+    icon: mdi:numeric-3-box-outline
+    optimistic: true
+    restore_value: true
+    options: ["Heat", "Fan"]
+    initial_option: "Heat"
+    entity_category: config
+    web_server: {sorting_group_id: grp_presets, sorting_weight: 30}
+  - platform: template
+    name: "Espar Preset 4 Mode"
+    id: preset4_mode
+    icon: mdi:numeric-4-box-outline
+    optimistic: true
+    restore_value: true
+    options: ["Heat", "Fan"]
+    initial_option: "Heat"
+    entity_category: config
+    web_server: {sorting_group_id: grp_presets, sorting_weight: 40}
+  - platform: template
+    name: "Espar Preset 5 Mode"
+    id: preset5_mode
+    icon: mdi:numeric-5-box-outline
+    optimistic: true
+    restore_value: true
+    options: ["Heat", "Fan"]
+    initial_option: "Heat"
+    entity_category: config
+    web_server: {sorting_group_id: grp_presets, sorting_weight: 50}
+  - platform: template
+    name: "Espar Preset 6 Mode"
+    id: preset6_mode
+    icon: mdi:numeric-6-box-outline
+    optimistic: true
+    restore_value: true
+    options: ["Heat", "Fan"]
+    initial_option: "Fan"
+    entity_category: config
+    web_server: {sorting_group_id: grp_presets, sorting_weight: 60}
+  - platform: template
+    name: "Espar Preset 7 Mode"
+    id: preset7_mode
+    icon: mdi:numeric-7-box-outline
+    optimistic: true
+    restore_value: true
+    options: ["Heat", "Fan"]
+    initial_option: "Heat"
+    entity_category: config
+    web_server: {sorting_group_id: grp_presets, sorting_weight: 70}
+  - platform: template
+    name: "Espar Preset 8 Mode"
+    id: preset8_mode
+    icon: mdi:numeric-8-box-outline
+    optimistic: true
+    restore_value: true
+    options: ["Heat", "Fan"]
+    initial_option: "Heat"
+    entity_category: config
+    web_server: {sorting_group_id: grp_presets, sorting_weight: 80}
+  - platform: template
+    name: "Espar Room Sensor"
+    id: sel_room_sensor
+    icon: mdi:thermometer
+    optimistic: true
+    restore_value: true
+    options:
+      - "Heater"        # the heater's own intake sensor
+      - "External"      # cabin_avg_temp
+    initial_option: "Heater"
+    web_server: {sorting_group_id: grp_control, sorting_weight: 3}
+    on_value:
+      - lambda: id(espar).set_room_sensor_controller(x == "External");
+
+# ── Max run time (safety) ───────────────────────────────────────────────────
+# The heater has no run-time limit of its own. HEAT or FAN ONLY is switched
+# off after this time, however it was started.
+number:
+  - platform: template
+    name: "Espar Max Run Time"
+    id: max_run_time
+    icon: mdi:timer-lock-outline
+    optimistic: true
+    restore_value: true
+    min_value: 10
+    max_value: 720
+    step: 10
+    initial_value: 120
+    unit_of_measurement: min
+    mode: box
+    web_server: {sorting_group_id: grp_control, sorting_weight: 4}
+
+  # ── Remote-start presets 1–8 (setpoint and duration)
+  - platform: template
+    name: "Espar Preset 1 Setpoint"
+    id: preset1_setp
+    icon: mdi:thermometer
+    optimistic: true
+    restore_value: true
+    min_value: 5
+    max_value: 35
+    step: 1
+    initial_value: 20
+    unit_of_measurement: "°C"
+    mode: box
+    entity_category: config
+    web_server: {sorting_group_id: grp_presets, sorting_weight: 11}
+  - platform: template
+    name: "Espar Preset 1 Duration"
+    id: preset1_dur
+    icon: mdi:timer-outline
+    optimistic: true
+    restore_value: true
+    min_value: 10
+    max_value: 720
+    step: 10
+    initial_value: 30
+    unit_of_measurement: min
+    mode: box
+    entity_category: config
+    web_server: {sorting_group_id: grp_presets, sorting_weight: 12}
+  - platform: template
+    name: "Espar Preset 2 Setpoint"
+    id: preset2_setp
+    icon: mdi:thermometer
+    optimistic: true
+    restore_value: true
+    min_value: 5
+    max_value: 35
+    step: 1
+    initial_value: 20
+    unit_of_measurement: "°C"
+    mode: box
+    entity_category: config
+    web_server: {sorting_group_id: grp_presets, sorting_weight: 21}
+  - platform: template
+    name: "Espar Preset 2 Duration"
+    id: preset2_dur
+    icon: mdi:timer-outline
+    optimistic: true
+    restore_value: true
+    min_value: 10
+    max_value: 720
+    step: 10
+    initial_value: 60
+    unit_of_measurement: min
+    mode: box
+    entity_category: config
+    web_server: {sorting_group_id: grp_presets, sorting_weight: 22}
+  - platform: template
+    name: "Espar Preset 3 Setpoint"
+    id: preset3_setp
+    icon: mdi:thermometer
+    optimistic: true
+    restore_value: true
+    min_value: 5
+    max_value: 35
+    step: 1
+    initial_value: 22
+    unit_of_measurement: "°C"
+    mode: box
+    entity_category: config
+    web_server: {sorting_group_id: grp_presets, sorting_weight: 31}
+  - platform: template
+    name: "Espar Preset 3 Duration"
+    id: preset3_dur
+    icon: mdi:timer-outline
+    optimistic: true
+    restore_value: true
+    min_value: 10
+    max_value: 720
+    step: 10
+    initial_value: 60
+    unit_of_measurement: min
+    mode: box
+    entity_category: config
+    web_server: {sorting_group_id: grp_presets, sorting_weight: 32}
+  - platform: template
+    name: "Espar Preset 4 Setpoint"
+    id: preset4_setp
+    icon: mdi:thermometer
+    optimistic: true
+    restore_value: true
+    min_value: 5
+    max_value: 35
+    step: 1
+    initial_value: 22
+    unit_of_measurement: "°C"
+    mode: box
+    entity_category: config
+    web_server: {sorting_group_id: grp_presets, sorting_weight: 41}
+  - platform: template
+    name: "Espar Preset 4 Duration"
+    id: preset4_dur
+    icon: mdi:timer-outline
+    optimistic: true
+    restore_value: true
+    min_value: 10
+    max_value: 720
+    step: 10
+    initial_value: 120
+    unit_of_measurement: min
+    mode: box
+    entity_category: config
+    web_server: {sorting_group_id: grp_presets, sorting_weight: 42}
+  - platform: template
+    name: "Espar Preset 5 Setpoint"
+    id: preset5_setp
+    icon: mdi:thermometer
+    optimistic: true
+    restore_value: true
+    min_value: 5
+    max_value: 35
+    step: 1
+    initial_value: 18
+    unit_of_measurement: "°C"
+    mode: box
+    entity_category: config
+    web_server: {sorting_group_id: grp_presets, sorting_weight: 51}
+  - platform: template
+    name: "Espar Preset 5 Duration"
+    id: preset5_dur
+    icon: mdi:timer-outline
+    optimistic: true
+    restore_value: true
+    min_value: 10
+    max_value: 720
+    step: 10
+    initial_value: 60
+    unit_of_measurement: min
+    mode: box
+    entity_category: config
+    web_server: {sorting_group_id: grp_presets, sorting_weight: 52}
+  - platform: template
+    name: "Espar Preset 6 Setpoint"
+    id: preset6_setp
+    icon: mdi:thermometer
+    optimistic: true
+    restore_value: true
+    min_value: 5
+    max_value: 35
+    step: 1
+    initial_value: 20
+    unit_of_measurement: "°C"
+    mode: box
+    entity_category: config
+    web_server: {sorting_group_id: grp_presets, sorting_weight: 61}
+  - platform: template
+    name: "Espar Preset 6 Duration"
+    id: preset6_dur
+    icon: mdi:timer-outline
+    optimistic: true
+    restore_value: true
+    min_value: 10
+    max_value: 720
+    step: 10
+    initial_value: 30
+    unit_of_measurement: min
+    mode: box
+    entity_category: config
+    web_server: {sorting_group_id: grp_presets, sorting_weight: 62}
+  - platform: template
+    name: "Espar Preset 7 Setpoint"
+    id: preset7_setp
+    icon: mdi:thermometer
+    optimistic: true
+    restore_value: true
+    min_value: 5
+    max_value: 35
+    step: 1
+    initial_value: 24
+    unit_of_measurement: "°C"
+    mode: box
+    entity_category: config
+    web_server: {sorting_group_id: grp_presets, sorting_weight: 71}
+  - platform: template
+    name: "Espar Preset 7 Duration"
+    id: preset7_dur
+    icon: mdi:timer-outline
+    optimistic: true
+    restore_value: true
+    min_value: 10
+    max_value: 720
+    step: 10
+    initial_value: 90
+    unit_of_measurement: min
+    mode: box
+    entity_category: config
+    web_server: {sorting_group_id: grp_presets, sorting_weight: 72}
+  - platform: template
+    name: "Espar Preset 8 Setpoint"
+    id: preset8_setp
+    icon: mdi:thermometer
+    optimistic: true
+    restore_value: true
+    min_value: 5
+    max_value: 35
+    step: 1
+    initial_value: 20
+    unit_of_measurement: "°C"
+    mode: box
+    entity_category: config
+    web_server: {sorting_group_id: grp_presets, sorting_weight: 81}
+  - platform: template
+    name: "Espar Preset 8 Duration"
+    id: preset8_dur
+    icon: mdi:timer-outline
+    optimistic: true
+    restore_value: true
+    min_value: 10
+    max_value: 720
+    step: 10
+    initial_value: 240
+    unit_of_measurement: min
+    mode: box
+    entity_category: config
+    web_server: {sorting_group_id: grp_presets, sorting_weight: 82}
+
+globals:
+  - id: remote_started      # true = running because of a remote command
+    type: bool
+    initial_value: "false"
+  - id: remote_stop_s       # uptime (s) at which the running preset ends; 0 = none
+    type: uint32_t
+    initial_value: "0"
+  - id: fmc_code            # last code seen from the tracker; 0 = nothing since boot, 1 = none
+    type: uint16_t
+    initial_value: "0"
+  - id: cmd_echo            # toggle bit of the last accepted BLE command (acknowledge)
+    type: uint8_t
+    initial_value: "0"
+  - id: cmd_result          # 0 none yet, 1 started, 2 switched off, 3 locked, 4 refused
+    type: uint8_t
+    initial_value: "0"
+  - id: active_preset       # 0 = none, 1–8 = running remote preset
+    type: uint8_t
+    initial_value: "0"
+  - id: ble_seq             # counter per page sent (shows the data is fresh)
+    type: uint8_t
+    initial_value: "0"
+  - id: run_started_s       # uptime (s) when the climate entity left OFF; 0 = off
+    type: uint32_t
+    initial_value: "0"
+
+interval:
+  - interval: 30s
+    then:
+      - lambda: |-
+          uint32_t now_s = millis() / 1000;
+          if (id(espar).mode == climate::CLIMATE_MODE_OFF) {
+            id(run_started_s) = 0; id(remote_stop_s) = 0; id(remote_started) = false;
+            if (id(active_preset) != 0) { id(active_preset) = 0; id(remote_input).publish_state(false); }
+            return;
+          }
+          if (id(remote_stop_s) != 0 && now_s >= id(remote_stop_s)) {
+            ESP_LOGW("remote", "duration of preset %u reached — switching off", id(active_preset));
+            id(remote_stop_s) = 0;
+            auto c = id(espar).make_call();
+            c.set_mode(climate::CLIMATE_MODE_OFF);
+            c.perform();
+            return;
+          }
+          if (id(run_started_s) == 0) { id(run_started_s) = now_s; return; }
+          if (now_s - id(run_started_s) >= (uint32_t) id(max_run_time).state * 60) {
+            ESP_LOGW("max_run_time", "%.0f min reached — switching off", id(max_run_time).state);
+            id(run_started_s) = 0;
+            auto call = id(espar).make_call();
+            call.set_mode(climate::CLIMATE_MODE_OFF);
+            call.perform();
+          }
+
+  # ── BLE feedback to the tracker ──────────────────────────────────────────────
+  # Packet: FF FF 53 48 + page 1 (→ tracker BLE connection #2)
+  #         FF FF 53 49 + page 2 (→ tracker BLE connection #3), alternating every 2 s.
+  # Multi-byte values little endian. "+40" = °C + 40; 255 = unknown.
+  # Page 1 (state — everything a remote start needs)
+  #   0  Status: bits 0–3 state (0 IDLE, 1 STARTUP, 2 HEATING, 3 FAN, 4 COOLDOWN,
+  #      5 FAULT, 6 INIT, 15 heater not connected), bits 4–6 result of the last
+  #      command (0 none, 1 started, 2 switched off, 3 locked, 4 refused),
+  #      bit 7 acknowledge = toggle bit of the last accepted BLE command
+  #      → tracker Custom 2, priority High + On Change (sent immediately)
+  #   1  Fault: 0 OK, 1 flame loss, 2 overtemperature, 3 other fault, 4 failed
+  #      start, 5 lockout, 6 idle lock, 7 heartbeat lost, 8 second controller
+  #      on the bus, 9 other  → tracker Custom 3, High + On Change
+  #   2  Phase: 0 Off, 1 Startup, 2 Pre-glow, 3 Ignition, 4 Flame ramp-up,
+  #      5 Burning, 6 Cooldown, 7 Control pause, 8 Ventilation, 15 other
+  #   3  Bits: 0 flame, 1 glow plug, 2 remote start enabled, 3 CAN standby,
+  #      4 HA connected, 5 external room sensor, 6 heater connected, 7 remote run
+  #   4  heater temperature +40     5  intake temperature +40
+  #   6  setpoint (climate) +40     7  power demand %
+  #   8–9  minutes left (0 = off)   10  supply voltage ×10
+  #   11–12 flame temperature °C (int16)   13 fuel rate ×100 l/h
+  #   14 blower level   15 glow plug power W   16 control unit +40
+  #   17–18 burn time min   19 running preset (0 = none)
+  #   20 climate mode (0 off, 1 heat, 2 fan)   21 counter
+  # Page 2 (counters, fault memory)
+  #   0–1 operating hours ×10   2–3 fuel total ×10 l   4–5 starts
+  #   6–9 pump strokes   10–19 first 5 codes of the fault memory
+  #   (P00xxxx → xxxx, 2 bytes each, 0 = empty)   20 WiFi dBm (absolute, 0 = none)   21 counter
+  - interval: 2s
+    then:
+      - lambda: |-
+          auto clampb = [](float v, float lo, float hi) -> uint8_t {
+            if (std::isnan(v)) return 255;
+            return (uint8_t) std::max(lo, std::min(hi, roundf(v)));
+          };
+          auto t40 = [&](sensor::Sensor *s) -> uint8_t {
+            return (s->has_state() && !std::isnan(s->state)) ? clampb(s->state + 40.0f, 0, 254) : 255;
+          };
+          auto u16 = [](std::vector<uint8_t> &d, uint32_t v) { if (v > 0xFFFF) v = 0xFFFF; d.push_back(v & 0xFF); d.push_back(v >> 8); };
+          auto num = [](sensor::Sensor *s) -> float { return (s->has_state() && !std::isnan(s->state)) ? s->state : 0.0f; };
+          static bool page2 = false;
+          std::vector<uint8_t> d = {0xFF, 0xFF, 0x53, (uint8_t) (page2 ? 0x49 : 0x48)};
+
+          if (!page2) {
+            // state
+            const std::string st = id(espar_heater_state).has_state() ? id(espar_heater_state).state : "";
+            uint8_t s = 15;
+            if (id(espar_connected).state) {
+              if      (st == "IDLE")     s = 0;
+              else if (st == "STARTUP")  s = 1;
+              else if (st == "HEATING")  s = 2;
+              else if (st == "FAN")      s = 3;
+              else if (st == "COOLDOWN") s = 4;
+              else if (st == "FAULT")    s = 5;
+              else if (st == "INIT")     s = 6;
+            }
+            d.push_back(s | ((id(cmd_result) & 0x07) << 4) | (id(cmd_echo) ? 0x80 : 0));
+            // fault
+            const std::string f = id(espar_fault).has_state() ? id(espar_fault).state : "OK";
+            uint8_t e = 9;
+            if      (f == "OK")                                   e = 0;
+            else if (f.find("FLAME_LOSS") != std::string::npos)   e = 1;
+            else if (f.find("OVERTEMP") != std::string::npos)     e = 2;
+            else if (f.rfind("FAULT", 0) == 0)                    e = 3;
+            else if (f.rfind("Failed start", 0) == 0)             e = 4;
+            else if (f.rfind("LOCKOUT", 0) == 0)                  e = 5;
+            else if (f.rfind("IDLE LOCK", 0) == 0)                e = 6;
+            else if (f.rfind("Heartbeat", 0) == 0)                e = 7;
+            else if (f.rfind("OTHER CONTROLLER", 0) == 0)         e = 8;
+            d.push_back(e);
+            // phase
+            const std::string ph = id(d_phase).has_state() ? id(d_phase).state : "";
+            static const char *const PH[] = {"Off", "Startup", "Pre-glow", "Ignition", "Flame ramp-up",
+                                             "Burning", "Cooldown", "Control pause", "Ventilation"};
+            uint8_t pc = 15;
+            for (uint8_t k = 0; k < 9; k++) if (ph == PH[k]) pc = k;
+            d.push_back(pc);
+            // bits
+            uint8_t b = 0;
+            if (id(d_flame).state)                       b |= 0x01;
+            if (id(d_glow).state)                        b |= 0x02;
+            if (id(remote_enable).state)                 b |= 0x04;
+            if (id(espar_standby).state)                 b |= 0x08;
+            if (api::global_api_server->is_connected())  b |= 0x10;
+            if (id(sel_room_sensor).active_index().value_or(0) == 1) b |= 0x20;
+            if (id(espar_connected).state)               b |= 0x40;
+            if (id(remote_started))                      b |= 0x80;
+            d.push_back(b);
+            d.push_back(t40(id(d_heater_temp)));
+            d.push_back(t40(id(d_intake)));
+            float tt = id(espar).target_temperature;
+            d.push_back(std::isnan(tt) ? 255 : clampb(tt + 40.0f, 0, 254));
+            d.push_back(clampb(num(id(d_demand)), 0, 254));
+            // minutes left = whichever ends first: Max Run Time or the preset duration
+            uint32_t now_s = millis() / 1000, rm = 0;
+            if (id(espar).mode != climate::CLIMATE_MODE_OFF) {
+              int32_t left = id(run_started_s) != 0
+                  ? (int32_t) id(max_run_time).state * 60 - (int32_t) (now_s - id(run_started_s))
+                  : (int32_t) id(max_run_time).state * 60;
+              if (id(remote_stop_s) != 0) left = std::min(left, (int32_t) id(remote_stop_s) - (int32_t) now_s);
+              rm = left <= 0 ? 0 : (left + 59) / 60;
+            }
+            u16(d, rm);
+            d.push_back(clampb(num(id(d_volt)) * 10.0f, 0, 254));
+            int16_t ft = (int16_t) roundf(num(id(d_flametemp)));
+            d.push_back(ft & 0xFF); d.push_back((ft >> 8) & 0xFF);
+            d.push_back(clampb(num(id(d_fuelrate)) * 100.0f, 0, 254));
+            d.push_back(clampb(num(id(d_blower)), 0, 254));
+            d.push_back(clampb(num(id(d_glowpw)), 0, 254));
+            d.push_back(t40(id(d_cutemp)));
+            u16(d, (uint32_t) (num(id(d_burn)) / 60.0f));
+            d.push_back(id(active_preset));
+            auto m = id(espar).mode;
+            d.push_back(m == climate::CLIMATE_MODE_HEAT ? 1 : m == climate::CLIMATE_MODE_FAN_ONLY ? 2 : 0);
+          } else {
+            u16(d, (uint32_t) roundf(num(id(d_ophours)) * 10.0f));
+            u16(d, (uint32_t) roundf(num(id(d_fueltotal)) * 10.0f));
+            u16(d, (uint32_t) num(id(d_starts)));
+            uint32_t st = (uint32_t) num(id(d_strokes));
+            for (int k = 0; k < 4; k++) d.push_back((st >> (8 * k)) & 0xFF);
+            // fault memory "P000115, P000129, …" → 0x0115, 0x0129, …
+            std::string fm = id(d_faultmem).has_state() ? id(d_faultmem).state : "";
+            int n = 0;
+            for (size_t pos = fm.find('P'); pos != std::string::npos && n < 5; pos = fm.find('P', pos + 1)) {
+              size_t e = pos + 1;
+              while (e < fm.size() && isxdigit((unsigned char) fm[e])) e++;
+              if (e - pos - 1 < 4) continue;
+              uint16_t c = (uint16_t) strtoul(fm.substr(e - 4, 4).c_str(), nullptr, 16);
+              u16(d, c); n++;
+            }
+            for (; n < 5; n++) u16(d, 0);
+            float r = id(wifi_rssi).state;
+            d.push_back((std::isnan(r) || !wifi::global_wifi_component->is_connected()) ? 0 : clampb(-r, 1, 254));
+          }
+          d.push_back(++id(ble_seq));
+          if (d.size() != 26) { ESP_LOGE("remote", "BLE page has %u bytes instead of 26", (unsigned) d.size()); return; }
+          static bool started = false;
+          if (!started) { esp32_ble::global_ble->advertising_start(); started = true; }
+          esp32_ble::global_ble->advertising_set_manufacturer_data(d);
+          page2 = !page2;
+
+# ── Safe mode (rolls back bad OTA after 10 crash-loops) ──────────────────────
+safe_mode:
+
+# ── mDNS ─────────────────────────────────────────────────────────────────────
+mdns:
+
+# ── BLE: advertise the feedback, listen for the tracker's command ────────────
+# The device name goes into the scan response, so the advertising packet holds
+# exactly flags (3 bytes) + manufacturer data (28 bytes) = 31 bytes.
+esp32_ble:
+  advertising: true
+
+esp32_ble_tracker:
+  scan_parameters:
+    active: true
+  on_ble_advertise:
+    - mac_address: ${tracker_mac}
+      then:
+        - lambda: |-
+            uint16_t code = 1;   // no service UUID in the packet
+            for (auto &u : x.get_service_uuids()) {
+              auto r = u.get_uuid();
+              if (r.len == ESP_UUID_LEN_16) code = r.uuid.uuid16;
+            }
+            uint16_t old = id(fmc_code);
+            if (code == old) return;
+            id(fmc_code) = code;
+            if (old == 0) {
+              // Take over the toggle bit of the standing command: the next command
+              // (with the bit flipped) is then a change, also after an ESP reboot.
+              if ((code >> 8) == 0x53) id(cmd_echo) = (code & 0x80) ? 1 : 0;
+              ESP_LOGI("remote", "tracker seen, baseline %04X", code);
+              return;
+            }
+            ESP_LOGW("remote", "code %04X → %04X", old, code);
+            // valid: 0x53 | T000 CCCC with C = 0…8
+            if ((code >> 8) != 0x53 || (code & 0x70) != 0 || (code & 0x0F) > 8) return;
+            id(cmd_echo) = (code & 0x80) ? 1 : 0;
+            id(run_cmd).execute(code & 0x0F);
+
+# ── Result of the last remote command (both paths) ───────────────────────────
+text_sensor:
+  - platform: template
+    id: remote_result
+    name: "Espar Remote Result"
+    icon: mdi:remote
+    web_server: {sorting_group_id: grp_control, sorting_weight: 7}
+
+# ── Execute a remote command — shared by both paths ─────────────────────────
+# BLE path: on_ble_advertise (code from the tracker) → run_cmd
+# LAN path: HA action esphome.<node>_remote_preset → run_cmd
+# cmd: 0 = off, 1–8 = preset. Same checks, same duration, same feedback.
+script:
+  - id: run_cmd
+    mode: queued
+    parameters:
+      cmd: int
+    then:
+      - lambda: |-
+          if (cmd == 0) {
+            ESP_LOGW("remote", "command: off");
+            id(cmd_result) = 2;
+            id(remote_result).publish_state("switched off");
+            id(remote_started) = false;
+            id(remote_stop_s) = 0;
+            id(active_preset) = 0;
+            id(remote_input).publish_state(false);
+            auto c = id(espar).make_call();
+            c.set_mode(climate::CLIMATE_MODE_OFF);
+            c.perform();
+            return;
+          }
+          if (!id(remote_enable).state) {
+            ESP_LOGW("remote", "preset %d: locked", cmd);
+            id(cmd_result) = 3; id(remote_result).publish_state("locked"); return;
+          }
+          if (id(espar_standby).state || !id(espar_connected).state) {
+            ESP_LOGW("remote", "preset %d: refused (CAN standby or heater not connected)", cmd);
+            id(cmd_result) = 4; id(remote_result).publish_state("refused"); return;
+          }
+          select::Select *modes[8] = {id(preset1_mode), id(preset2_mode), id(preset3_mode), id(preset4_mode),
+                                      id(preset5_mode), id(preset6_mode), id(preset7_mode), id(preset8_mode)};
+          number::Number *setps[8] = {id(preset1_setp), id(preset2_setp), id(preset3_setp), id(preset4_setp),
+                                      id(preset5_setp), id(preset6_setp), id(preset7_setp), id(preset8_setp)};
+          number::Number *durs[8]  = {id(preset1_dur), id(preset2_dur), id(preset3_dur), id(preset4_dur),
+                                      id(preset5_dur), id(preset6_dur), id(preset7_dur), id(preset8_dur)};
+          bool fan = modes[cmd - 1]->active_index().value_or(0) == 1;
+          float sp = setps[cmd - 1]->state;
+          uint32_t dur_min = (uint32_t) durs[cmd - 1]->state;
+          ESP_LOGW("remote", "command: preset %d → %s, %.0f °C, %u min", cmd, fan ? "fan" : "heat", sp, (unsigned) dur_min);
+          id(cmd_result) = 1;
+          id(remote_result).publish_state(str_sprintf("preset %d started", cmd));
+          id(remote_started) = true;
+          id(active_preset) = cmd;
+          id(remote_input).publish_state(true);
+          id(remote_stop_s) = millis() / 1000 + dur_min * 60;
+          auto c = id(espar).make_call();
+          c.set_mode(fan ? climate::CLIMATE_MODE_FAN_ONLY : climate::CLIMATE_MODE_HEAT);
+          if (!fan) c.set_target_temperature(sp);
+          c.perform();

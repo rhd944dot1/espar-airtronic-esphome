@@ -76,6 +76,7 @@ If your HA cabin temperature sensor reports in **Fahrenheit**, set `cabin_temp_u
 |---|---|
 | `espar-heater.yaml` | Minimal: the core entities, diagnostics only as comments |
 | `espar-heater-full.yaml` | Everything: a select to switch the room sensor at run time, every diagnostic entity, a *Max Run Time* safety limit, and the web dashboard sorted into groups |
+| `espar-heater-teltonika.yaml` | The full example plus remote start through a Teltonika GPS tracker over BLE (8 presets, feedback whether the heater runs). Home Assistant package: `home-assistant/teltonika-remote-start.yaml`. Guide: [docs/teltonika-remote-start.md](../docs/teltonika-remote-start.md) |
 
 Both use the same hardware section and secrets (the full one needs no extra secrets).
 

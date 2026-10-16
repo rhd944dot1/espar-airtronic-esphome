@@ -1,0 +1,496 @@
+# ═══ Home Assistant package: heater remote start through a Teltonika tracker ═══
+# See docs/teltonika-remote-start.md.
+#
+# Path:     HA → rest_command → Traccar API → tracker (setparam 1111) → BLE → ESP
+#           or, when the ESP is online in HA, the ESP action directly (LAN).
+# Feedback: ESP → BLE → tracker (io467 status, io468 fault, io332 page 1,
+#           io333 page 2) → Traccar → device_tracker attributes → sensors below.
+#
+# Adjust the entity IDs marked "# ← adjust":
+#   device_tracker.my_vehicle             your Traccar device (custom attributes
+#                                         io332, io333, io467, io468 enabled)
+#   …espar_heater_…                       entities of the ESP node "espar-heater"
+#   notify.notify                         your notification service
+# Secrets: traccar_auth ("Bearer <token>"), traccar_command_url.
+# Traccar device id: "deviceId" in the payload below.  # ← adjust
+
+rest_command:
+  traccar_command:
+    url: !secret traccar_command_url
+    method: post
+    headers:
+      Authorization: !secret traccar_auth
+    content_type: application/json
+    payload: '{"deviceId": 1, "type": "custom", "attributes": {"data": "{{ command }}"}}'
+    timeout: 20
+
+# The sensors are trigger-based: they change only when Traccar really delivers
+# the value. Positions without these attributes (e.g. command responses) keep
+# the last state.
+template:
+  # Status (io467): state, result of the last command, acknowledge bit — immediate
+  - triggers:
+      - trigger: state
+        entity_id: device_tracker.my_vehicle   # ← adjust
+        attribute: io467
+      - trigger: homeassistant
+        event: start
+      - trigger: event
+        event_type: event_template_reloaded
+    conditions:
+      - condition: template
+        value_template: "{{ state_attr('device_tracker.my_vehicle', 'io467') is number }}"
+    actions:
+      - variables:
+          s: "{{ state_attr('device_tracker.my_vehicle', 'io467') | int }}"
+    sensor:
+      - name: Heater Remote State
+        unique_id: heater_remote_state
+        icon: mdi:radiator
+        state: >-
+          {% set z = s % 16 %}
+          {{ ['Off', 'Startup', 'Heating', 'Fan', 'Cooldown', 'Fault', 'Init'][z] if z < 7 else 'Not connected' }}
+        attributes:
+          code: "{{ s % 16 }}"
+          ack: "{{ s // 128 }}"
+          result: "{{ s // 16 % 8 }}"
+      - name: Heater Remote Command
+        unique_id: heater_remote_command
+        icon: mdi:remote
+        state: >-
+          {{ ['none yet', 'started', 'switched off', 'locked', 'refused'][s // 16 % 8]
+             if s // 16 % 8 < 5 else 'unknown' }}
+
+  # Fault (io468) — immediate
+  - triggers:
+      - trigger: state
+        entity_id: device_tracker.my_vehicle   # ← adjust
+        attribute: io468
+      - trigger: homeassistant
+        event: start
+      - trigger: event
+        event_type: event_template_reloaded
+    conditions:
+      - condition: template
+        value_template: "{{ state_attr('device_tracker.my_vehicle', 'io468') is number }}"
+    sensor:
+      - name: Heater Remote Fault
+        unique_id: heater_remote_fault
+        icon: mdi:alert-circle-outline
+        state: >-
+          {% set e = state_attr('device_tracker.my_vehicle', 'io468') | int %}
+          {{ ['OK', 'Flame loss', 'Overtemperature', 'Fault', 'Failed start', 'Lockout',
+              'Idle lock', 'Heater not responding', 'Second controller on the bus', 'Other'][e]
+             if e < 10 else 'unknown' }}
+
+  # Page 1 (io332, 22 bytes) — with every record
+  - triggers:
+      - trigger: state
+        entity_id: device_tracker.my_vehicle   # ← adjust
+        attribute: io332
+    conditions:
+      - condition: template
+        value_template: "{{ trigger.to_state.attributes.io332 is string and trigger.to_state.attributes.io332 | length == 44 }}"
+    actions:
+      - variables:
+          b: >-
+            {% set h = trigger.to_state.attributes.io332 %}
+            {% set ns = namespace(l=[]) %}
+            {% for i in range(0, 44, 2) %}{% set ns.l = ns.l + [h[i:i+2] | int(base=16)] %}{% endfor %}
+            {{ ns.l }}
+    sensor:
+      - name: Heater Remote Phase
+        unique_id: heater_remote_phase
+        icon: mdi:fire-circle
+        state: >-
+          {{ ['Off', 'Startup', 'Pre-glow', 'Ignition', 'Flame ramp-up', 'Burning', 'Cooldown',
+              'Control pause', 'Ventilation'][b[2]] if b[2] < 9 else 'other' }}
+      - name: Heater Remote Temperature
+        unique_id: heater_remote_temperature
+        device_class: temperature
+        state_class: measurement
+        unit_of_measurement: "°C"
+        state: "{{ b[4] - 40 if b[4] != 255 else none }}"
+      - name: Heater Remote Intake Temperature
+        unique_id: heater_remote_intake_temperature
+        device_class: temperature
+        state_class: measurement
+        unit_of_measurement: "°C"
+        state: "{{ b[5] - 40 if b[5] != 255 else none }}"
+      - name: Heater Remote Setpoint
+        unique_id: heater_remote_setpoint
+        device_class: temperature
+        unit_of_measurement: "°C"
+        state: "{{ b[6] - 40 if b[6] != 255 else none }}"
+      - name: Heater Remote Power Demand
+        unique_id: heater_remote_power_demand
+        icon: mdi:gauge
+        state_class: measurement
+        unit_of_measurement: "%"
+        state: "{{ b[7] }}"
+      - name: Heater Remote Minutes Left
+        unique_id: heater_remote_minutes_left
+        icon: mdi:timer-sand
+        device_class: duration
+        unit_of_measurement: min
+        state: "{{ b[8] + b[9] * 256 }}"
+      - name: Heater Remote Supply Voltage
+        unique_id: heater_remote_supply_voltage
+        device_class: voltage
+        state_class: measurement
+        unit_of_measurement: V
+        state: "{{ (b[10] / 10) | round(1) if b[10] != 255 else none }}"
+      - name: Heater Remote Flame Temperature
+        unique_id: heater_remote_flame_temperature
+        device_class: temperature
+        state_class: measurement
+        unit_of_measurement: "°C"
+        state: "{{ b[11] + b[12] * 256 - (65536 if b[12] > 127 else 0) }}"
+      - name: Heater Remote Fuel Rate
+        unique_id: heater_remote_fuel_rate
+        icon: mdi:gas-station
+        device_class: volume_flow_rate
+        state_class: measurement
+        unit_of_measurement: L/h
+        state: "{{ (b[13] / 100) | round(2) if b[13] != 255 else none }}"
+      - name: Heater Remote Blower Level
+        unique_id: heater_remote_blower_level
+        icon: mdi:fan
+        state_class: measurement
+        state: "{{ b[14] }}"
+      - name: Heater Remote Glow Plug Power
+        unique_id: heater_remote_glow_plug_power
+        device_class: power
+        state_class: measurement
+        unit_of_measurement: W
+        state: "{{ b[15] }}"
+      - name: Heater Remote Control Unit Temperature
+        unique_id: heater_remote_control_unit_temperature
+        device_class: temperature
+        state_class: measurement
+        unit_of_measurement: "°C"
+        state: "{{ b[16] - 40 if b[16] != 255 else none }}"
+      - name: Heater Remote Burn Time
+        unique_id: heater_remote_burn_time
+        icon: mdi:timer-outline
+        device_class: duration
+        unit_of_measurement: min
+        state: "{{ b[17] + b[18] * 256 }}"
+      - name: Heater Remote Preset
+        unique_id: heater_remote_preset
+        icon: mdi:numeric
+        state: "{{ b[19] if b[19] else 'none' }}"
+      - name: Heater Remote Mode
+        unique_id: heater_remote_mode
+        icon: mdi:hvac
+        state: "{{ ['Off', 'Heat', 'Fan'][b[20]] if b[20] < 3 else 'unknown' }}"
+      - name: Heater Remote Last Data
+        unique_id: heater_remote_last_data
+        icon: mdi:clock-check-outline
+        device_class: timestamp
+        state: "{{ now().isoformat() }}"
+        attributes:
+          counter: "{{ b[21] }}"
+    binary_sensor:
+      - name: Heater Remote Flame
+        unique_id: heater_remote_flame
+        device_class: heat
+        state: "{{ b[3] % 2 == 1 }}"
+      - name: Heater Remote Glow Plug
+        unique_id: heater_remote_glow_plug
+        icon: mdi:lightning-bolt
+        state: "{{ b[3] // 2 % 2 == 1 }}"
+      - name: Heater Remote Start Enabled
+        unique_id: heater_remote_start_enabled
+        icon: mdi:car-key
+        state: "{{ b[3] // 4 % 2 == 1 }}"
+      - name: Heater Remote CAN Standby
+        unique_id: heater_remote_can_standby
+        icon: mdi:pause-circle-outline
+        state: "{{ b[3] // 8 % 2 == 1 }}"
+      - name: Heater Remote ESP in WiFi
+        unique_id: heater_remote_esp_in_wifi
+        device_class: connectivity
+        state: "{{ b[3] // 16 % 2 == 1 }}"
+      - name: Heater Remote External Room Sensor
+        unique_id: heater_remote_external_room_sensor
+        icon: mdi:thermometer
+        state: "{{ b[3] // 32 % 2 == 1 }}"
+      - name: Heater Remote Heater Connected
+        unique_id: heater_remote_heater_connected
+        device_class: connectivity
+        state: "{{ b[3] // 64 % 2 == 1 }}"
+      - name: Heater Remote Run
+        unique_id: heater_remote_run
+        icon: mdi:remote
+        state: "{{ b[3] // 128 == 1 }}"
+
+  # Page 2 (io333, 22 bytes) — counters and fault memory
+  - triggers:
+      - trigger: state
+        entity_id: device_tracker.my_vehicle   # ← adjust
+        attribute: io333
+    conditions:
+      - condition: template
+        value_template: "{{ trigger.to_state.attributes.io333 is string and trigger.to_state.attributes.io333 | length == 44 }}"
+    actions:
+      - variables:
+          c: >-
+            {% set h = trigger.to_state.attributes.io333 %}
+            {% set ns = namespace(l=[]) %}
+            {% for i in range(0, 44, 2) %}{% set ns.l = ns.l + [h[i:i+2] | int(base=16)] %}{% endfor %}
+            {{ ns.l }}
+    sensor:
+      - name: Heater Remote Operating Hours
+        unique_id: heater_remote_operating_hours
+        device_class: duration
+        state_class: total_increasing
+        unit_of_measurement: h
+        state: "{{ ((c[0] + c[1] * 256) / 10) | round(1) }}"
+      - name: Heater Remote Fuel Total
+        unique_id: heater_remote_fuel_total
+        device_class: volume
+        state_class: total_increasing
+        unit_of_measurement: L
+        state: "{{ ((c[2] + c[3] * 256) / 10) | round(1) }}"
+      - name: Heater Remote Starts
+        unique_id: heater_remote_starts
+        icon: mdi:counter
+        state_class: total_increasing
+        state: "{{ c[4] + c[5] * 256 }}"
+      - name: Heater Remote Pump Strokes
+        unique_id: heater_remote_pump_strokes
+        icon: mdi:pump
+        state_class: total_increasing
+        state: "{{ c[6] + c[7] * 256 + c[8] * 65536 + c[9] * 16777216 }}"
+      - name: Heater Remote Fault Memory
+        unique_id: heater_remote_fault_memory
+        icon: mdi:alert-box-outline
+        state: >-
+          {% set ns = namespace(f=[]) %}
+          {% for k in range(5) %}{% set v = c[10 + 2 * k] + c[11 + 2 * k] * 256 %}{% if v %}{% set ns.f = ns.f + ['P00%04X' % v] %}{% endif %}{% endfor %}
+          {{ ns.f | join(', ') if ns.f else 'empty' }}
+      - name: Heater Remote WiFi Signal
+        unique_id: heater_remote_wifi_signal
+        device_class: signal_strength
+        state_class: measurement
+        unit_of_measurement: dBm
+        state: "{{ -c[20] if c[20] else none }}"
+
+script:
+  heater_remote_start:
+    alias: Heater remote start
+    description: >-
+      Starts preset 1–8 or switches off (0). Path chosen automatically: ESP online
+      in HA → ESP action over LAN; otherwise (or if that does not take effect)
+      Traccar → tracker (parameter 1111) → BLE → ESP, with acknowledge.
+    icon: mdi:car-key
+    mode: restart
+    fields:
+      preset:
+        name: Preset
+        description: 1–8 = preset on the ESP, 0 = off
+        required: true
+        default: "1"
+        selector:
+          select:
+            mode: dropdown
+            options:
+              - {value: "1", label: "Preset 1"}
+              - {value: "2", label: "Preset 2"}
+              - {value: "3", label: "Preset 3"}
+              - {value: "4", label: "Preset 4"}
+              - {value: "5", label: "Preset 5"}
+              - {value: "6", label: "Preset 6"}
+              - {value: "7", label: "Preset 7"}
+              - {value: "8", label: "Preset 8"}
+              - {value: "0", label: "Off"}
+    sequence:
+      - variables:
+          p: "{{ preset | int(0) }}"
+          t: "{{ 1 - (state_attr('sensor.heater_remote_state', 'ack') | int(0)) }}"
+          code: "{{ '%04X' % (21248 + t * 128 + p) }}"
+          what: "{{ 'Off' if p == 0 else 'Preset ' ~ p }}"
+        note: New toggle bit = opposite of the last acknowledged one → every command is a change.
+
+      # ── LAN path ──────────────────────────────────────────────────────────
+      - if:
+          - condition: state
+            entity_id: binary_sensor.espar_heater_espar_node_status   # ← adjust
+            state: "on"
+        then:
+          - if:
+              - condition: state
+                entity_id: switch.espar_heater_espar_remote_start   # ← adjust
+                state: "off"
+            then:
+              - action: notify.notify   # ← adjust
+                data:
+                  title: Heater
+                  message: "{{ what }}: locked (switch \"Espar Remote Start\" is off)."
+                continue_on_error: true
+              - stop: locked
+          - action: esphome.espar_heater_remote_preset   # ← adjust (esphome.<node>_remote_preset)
+            data:
+              preset: "{{ p }}"
+            continue_on_error: true
+          - wait_template: >-
+              {{ is_state('climate.espar_heater_espar_heater', 'off') if p == 0
+                 else states('climate.espar_heater_espar_heater') in ['heat', 'fan_only'] }}
+            timeout:
+              seconds: 15
+          - if:
+              - condition: template
+                value_template: "{{ wait.completed }}"
+            then:
+              - if:
+                  - condition: template
+                    value_template: "{{ p == 0 }}"
+                then:
+                  - wait_template: "{{ is_state('sensor.espar_heater_espar_heater_state', 'IDLE') }}"
+                    timeout:
+                      minutes: 10
+                  - action: notify.notify
+                    data:
+                      title: Heater
+                      message: "{{ 'Is off' if is_state('sensor.espar_heater_espar_heater_state', 'IDLE') else 'Off command arrived, heater still reports ' ~ states('sensor.espar_heater_espar_heater_state') }} (LAN)."
+                    continue_on_error: true
+                  - stop: off via LAN
+              - wait_template: >-
+                  {{ states('sensor.espar_heater_espar_heater_state') in ['HEATING', 'FAN', 'FAULT']
+                     or states('sensor.espar_heater_espar_fault') not in ['OK', 'unknown', 'unavailable'] }}
+                timeout:
+                  minutes: 6
+              - action: notify.notify
+                data:
+                  title: Heater
+                  message: >-
+                    {% set z = states('sensor.espar_heater_espar_heater_state') %}{% set f = states('sensor.espar_heater_espar_fault') %}
+                    {% if z in ['HEATING', 'FAN'] and f == 'OK' %}{{ what }} running ({{ z | lower }}, LAN).
+                    {% elif f not in ['OK', 'unknown', 'unavailable'] %}{{ what }}: FAULT – {{ f }} (LAN).
+                    {% else %}{{ what }}: arrived, but not heating after 6 min (state {{ z }}, LAN).{% endif %}
+                continue_on_error: true
+              - stop: done via LAN
+        note: ESP online → LAN (~1 s). If the climate entity does not react within 15 s, fall through to Traccar.
+
+      # ── Tracker path ──────────────────────────────────────────────────────
+      - action: rest_command.traccar_command
+        data:
+          command: "setparam 1111:{{ code }}"
+        response_variable: answer
+        continue_on_error: true
+      - if:
+          - condition: template
+            value_template: "{{ answer is not defined or answer.status not in [200, 202] }}"
+        then:
+          - action: notify.notify
+            data:
+              title: Heater
+              message: "{{ what }}: Traccar did not accept the command (status {{ answer.status if answer is defined else 'no answer' }})."
+            continue_on_error: true
+          - stop: Traccar did not accept the command
+            error: true
+      - wait_template: "{{ state_attr('sensor.heater_remote_state', 'ack') | int(-1) == t }}"
+        timeout:
+          minutes: 3
+        note: The acknowledge comes as an immediate record (io467 High / On Change).
+      - if:
+          - condition: template
+            value_template: "{{ not wait.completed }}"
+        then:
+          - action: notify.notify
+            data:
+              title: Heater
+              message: "{{ what }}: no acknowledge after 3 min – the ESP did not receive the command (power? range?). Command 1111:{{ code }} stays in the tracker."
+            continue_on_error: true
+          - stop: no acknowledge
+            error: true
+      - variables:
+          res: "{{ state_attr('sensor.heater_remote_state', 'result') | int(0) }}"
+      - if:
+          - condition: template
+            value_template: "{{ res in [3, 4] }}"
+        then:
+          - action: notify.notify
+            data:
+              title: Heater
+              message: "{{ what }}: arrived, but {{ 'locked (switch \"Espar Remote Start\" is off)' if res == 3 else 'refused (CAN standby on or heater not connected)' }}."
+            continue_on_error: true
+          - stop: refused
+      - if:
+          - condition: template
+            value_template: "{{ p == 0 }}"
+        then:
+          - wait_template: "{{ states('sensor.heater_remote_state') in ['Off', 'Fault'] }}"
+            timeout:
+              minutes: 10
+          - action: notify.notify
+            data:
+              title: Heater
+              message: "{{ 'Is off.' if is_state('sensor.heater_remote_state', 'Off') else 'Off command arrived, state now: ' ~ states('sensor.heater_remote_state') ~ ' / ' ~ states('sensor.heater_remote_fault') }}"
+            continue_on_error: true
+          - stop: off
+      - wait_template: >-
+          {{ states('sensor.heater_remote_state') in ['Heating', 'Fan', 'Fault']
+             or states('sensor.heater_remote_fault') not in ['OK', 'unknown', 'unavailable'] }}
+        timeout:
+          minutes: 6
+        note: Cold ignition takes up to ~110 s; the state comes as an immediate record.
+      - action: notify.notify
+        data:
+          title: Heater
+          message: >-
+            {% set z = states('sensor.heater_remote_state') %}{% set f = states('sensor.heater_remote_fault') %}
+            {% if z in ['Heating', 'Fan'] and f == 'OK' %}{{ what }} running ({{ z | lower }}).
+            {% elif f not in ['OK', 'unknown', 'unavailable'] %}{{ what }}: FAULT – {{ f }} (state {{ z }}).
+            {% else %}{{ what }}: arrived, but not heating after 6 min (state {{ z }}).{% endif %}
+        continue_on_error: true
+
+automation:
+  - id: heater_remote_reboot_or_fault
+    alias: "Heater: report ESP reboot or fault"
+    description: >-
+      An ESP reboot ends a run (the component always starts with the heater off,
+      and the ESP does not restart a run). Reports that, and every heater fault.
+      Source: immediate records through the tracker — works without WiFi at the vehicle.
+    mode: single
+    max_exceeded: silent
+    triggers:
+      - trigger: state
+        entity_id: sensor.heater_remote_command
+        to: "none yet"
+        not_from: ["unknown", "unavailable"]
+        id: reboot
+      - trigger: state
+        entity_id: sensor.heater_remote_state
+        to: "Not connected"
+        not_from: ["unknown", "unavailable"]
+        id: reboot
+      - trigger: state
+        entity_id: sensor.heater_remote_fault
+        not_to: ["OK", "unknown", "unavailable"]
+        not_from: ["unknown", "unavailable"]
+        id: fault
+    actions:
+      - choose:
+          - conditions:
+              - condition: trigger
+                id: reboot
+            sequence:
+              - action: notify.notify   # ← adjust
+                data:
+                  title: Heater
+                  message: "The heater's ESP rebooted. A running heater run has ended. State now: {{ states('sensor.heater_remote_state') }}."
+                continue_on_error: true
+          - conditions:
+              - condition: trigger
+                id: fault
+            sequence:
+              - action: notify.notify   # ← adjust
+                data:
+                  title: Heater – fault
+                  message: "The heater reports: {{ states('sensor.heater_remote_fault') }} (state {{ states('sensor.heater_remote_state') }})."
+                continue_on_error: true
+      - delay:
+          minutes: 1
+        note: A reboot usually fires both reboot triggers shortly after each other.
