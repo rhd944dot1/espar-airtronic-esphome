@@ -1,4 +1,4 @@
-# Espar Airtronic S3 B2L — CAN Bus Reverse Engineering & ESPHome Controller
+# Espar Airtronic S3 B2L — CAN Bus Reverse Engineering & ESPHome Controller & Remote start via Teltonika
 
 > Control and monitor your Espar Airtronic S3 gasoline heater from Home Assistant via CAN bus — no OEM controller required.
 >
